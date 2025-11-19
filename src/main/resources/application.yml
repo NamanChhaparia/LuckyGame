@@ -1,0 +1,72 @@
+spring:
+  application:
+    name: luck-reward-engine
+  
+  # Database Configuration
+  datasource:
+    url: jdbc:h2:mem:gaming_db
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  
+  # H2 Console Configuration (for development)
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  
+  # JPA Configuration
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.H2Dialect
+        format_sql: true
+        use_sql_comments: true
+    open-in-view: false
+    # Ensure data.sql runs AFTER Hibernate creates tables
+    defer-datasource-initialization: true
+  
+  # SQL Script Initialization
+  sql:
+    init:
+      mode: always
+      continue-on-error: false
+  
+  # Jackson Configuration
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    time-zone: UTC
+
+# Server Configuration
+server:
+  port: 8080
+  error:
+    include-message: always
+    include-binding-errors: always
+
+# Logging Configuration
+logging:
+  level:
+    root: INFO
+    com.gaming.luckengine: DEBUG
+    org.hibernate.SQL: DEBUG
+    org.hibernate.type.descriptor.sql.BasicBinder: TRACE
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+
+# Application Custom Properties
+app:
+  game:
+    default-win-probability: 0.15
+    default-volatility-factor: 1.2
+    batch-processing-interval-ms: 1000
+    max-batch-size: 5000
+  
+  security:
+    enabled: false
+

@@ -1,0 +1,60 @@
+# Ignore unnecessary files when building Docker image
+# This makes builds faster and images smaller
+
+# Maven build artifacts
+target/
+!target/*.jar
+
+# IDE files
+.idea/
+.vscode/
+.settings/
+.project
+.classpath
+*.iml
+*.iws
+*.ipr
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation (not needed in image)
+*.md
+docs/
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+*~
+
+# Logs
+*.log
+logs/
+
+# Test files (already in target)
+src/test/
+
+# Docker files (don't copy into image)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Maven wrapper (using container Maven)
+.mvn/
+mvnw
+mvnw.cmd
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+

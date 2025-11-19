@@ -1,0 +1,45 @@
+spring:
+  # Production Database Configuration (PostgreSQL)
+  datasource:
+    url: jdbc:postgresql://localhost:5432/luck_reward_engine
+    driver-class-name: org.postgresql.Driver
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:postgres}
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+  
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        jdbc:
+          batch_size: 20
+        order_inserts: true
+        order_updates: true
+  
+  h2:
+    console:
+      enabled: false
+
+# Server Configuration
+server:
+  port: ${SERVER_PORT:8080}
+
+# Logging Configuration
+logging:
+  level:
+    root: WARN
+    com.gaming.luckengine: INFO
+    org.hibernate.SQL: WARN
+  file:
+    name: logs/luck-reward-engine.log
+    max-size: 10MB
+    max-history: 30
+

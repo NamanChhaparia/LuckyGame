@@ -1,0 +1,88 @@
+# Production Docker Compose configuration
+# Use with: docker-compose -f docker-compose-prod.yml up
+
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:14-alpine
+    container_name: luck-engine-db
+    environment:
+      - POSTGRES_DB=luck_reward_engine
+      - POSTGRES_USER=gaming_user
+      - POSTGRES_PASSWORD=gaming_secure_password_change_me
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gaming_user -d luck_reward_engine"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - gaming-network
+
+  # Application with PostgreSQL
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: luck-reward-engine-prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      # Spring Profile
+      - SPRING_PROFILES_ACTIVE=prod
+      
+      # PostgreSQL Configuration
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/luck_reward_engine
+      - SPRING_DATASOURCE_USERNAME=gaming_user
+      - SPRING_DATASOURCE_PASSWORD=gaming_secure_password_change_me
+      
+      # JPA Configuration
+      - SPRING_JPA_HIBERNATE_DDL_AUTO=update
+      - SPRING_JPA_SHOW_SQL=false
+      
+      # Performance tuning
+      - SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE=20
+      - SPRING_DATASOURCE_HIKARI_MINIMUM_IDLE=5
+      
+      # Logging
+      - LOGGING_LEVEL_ROOT=WARN
+      - LOGGING_LEVEL_COM_GAMING_LUCKENGINE=INFO
+    
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    # Resource limits for production
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+    
+    restart: unless-stopped
+    networks:
+      - gaming-network
+
+networks:
+  gaming-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+    driver: local
+
