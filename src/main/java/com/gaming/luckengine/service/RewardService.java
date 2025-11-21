@@ -15,6 +15,7 @@ import com.gaming.luckengine.repository.RewardTransactionRepository;
 import com.gaming.luckengine.repository.VoucherRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -57,6 +58,42 @@ public class RewardService {
      */
     @Transactional
     public RewardResponse processBatch(RewardRequest request) {
+        return processBatchWithRetry(request, 3);
+    }
+
+    /**
+     * Process batch with retry logic for optimistic locking conflicts.
+     */
+    private RewardResponse processBatchWithRetry(RewardRequest request, int maxRetries) {
+        int attempt = 0;
+        while (attempt < maxRetries) {
+            try {
+                return processBatchInternal(request);
+            } catch (OptimisticLockingFailureException e) {
+                attempt++;
+                if (attempt >= maxRetries) {
+                    log.error("Failed to process batch {} after {} retries due to optimistic locking conflict", 
+                            request.getBatchId(), maxRetries);
+                    throw new GameStateException("Unable to process batch due to concurrent modifications. Please retry.");
+                }
+                log.warn("Optimistic locking conflict on batch {}, retrying (attempt {}/{})", 
+                        request.getBatchId(), attempt, maxRetries);
+                // Brief delay before retry
+                try {
+                    Thread.sleep(10 + (attempt * 5)); // Exponential backoff
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new GameStateException("Batch processing interrupted");
+                }
+            }
+        }
+        throw new GameStateException("Failed to process batch after retries");
+    }
+
+    /**
+     * Internal batch processing method.
+     */
+    private RewardResponse processBatchInternal(RewardRequest request) {
         long startTime = System.currentTimeMillis();
         log.info("Processing batch: {} for game: {} with {} users", 
                 request.getBatchId(), request.getGameId(), request.getUsernames().size());
@@ -67,7 +104,7 @@ public class RewardService {
             return getCachedBatchResults(request.getBatchId());
         }
 
-        // Step 2: Global checks - Game status and budget
+        // Step 2: Global checks - Game status and budget (with pessimistic lock)
         Game game = gameRepository.findByIdWithLock(request.getGameId())
                 .orElseThrow(() -> new GameStateException("Game not found: " + request.getGameId()));
 
@@ -77,11 +114,14 @@ public class RewardService {
         }
 
         // Step 3: Calculate Tick Budget using Dynamic Decay Model
+        // Re-read game state to ensure we have latest remainingBudget
+        BigDecimal remainingBudget = game.getRemainingBudget();
         BigDecimal tickBudget = game.calculateTickBudget();
         log.info("Tick budget calculated: {} (Remaining: {}, Seconds left: {})", 
-                tickBudget, game.getRemainingBudget(), game.getRemainingSeconds());
+                tickBudget, remainingBudget, game.getRemainingSeconds());
 
         // Step 4: Fetch candidate vouchers within budget constraint
+        // Note: Vouchers will be locked individually when decrementing inventory
         List<Voucher> candidateVouchers = voucherRepository
                 .findAvailableVouchersWithinBudget(tickBudget);
 
@@ -98,13 +138,35 @@ public class RewardService {
         List<UserRewardResult> results = new ArrayList<>();
         BigDecimal currentBatchSpend = BigDecimal.ZERO;
 
-        for (String username : shuffledUsernames) {
+        // Use index-based loop to avoid inefficient indexOf() calls
+        for (int userIndex = 0; userIndex < shuffledUsernames.size(); userIndex++) {
+            String username = shuffledUsernames.get(userIndex);
             User user = userService.getOrCreateUser(username, null, null);
             
+            // Re-read game state before each user to ensure budget accuracy
+            // This prevents overspending when multiple batches run concurrently
+            game = gameRepository.findByIdWithLock(request.getGameId())
+                    .orElseThrow(() -> new GameStateException("Game not found: " + request.getGameId()));
+            
+            if (!game.isActiveAndFunded()) {
+                log.info("Game {} became inactive during batch processing. Processing remaining users as losses.", game.getId());
+                // Process remaining users as losses
+                for (int i = userIndex; i < shuffledUsernames.size(); i++) {
+                    User remainingUser = userService.getOrCreateUser(shuffledUsernames.get(i), null, null);
+                    results.add(createLossResult(remainingUser, game, request.getBatchId()));
+                }
+                break;
+            }
+
+            // Recalculate tickBudget with latest game state
+            BigDecimal currentRemainingBudget = game.getRemainingBudget();
+            BigDecimal currentTickBudget = game.calculateTickBudget();
+            
+            // Pass budget values instead of game object to avoid stale data
             UserRewardResult result = processUserReward(
-                    user, game, request.getBatchId(), 
-                    candidateVouchers, tickBudget, 
-                    currentBatchSpend, game.getWinProbability());
+                    user, game, request.getGameId(), request.getBatchId(), 
+                    candidateVouchers, currentTickBudget, 
+                    currentBatchSpend, currentRemainingBudget, game.getWinProbability());
 
             results.add(result);
 
@@ -114,11 +176,12 @@ public class RewardService {
             }
 
             // Early termination if budget exhausted
-            if (currentBatchSpend.compareTo(tickBudget) >= 0 || 
-                currentBatchSpend.compareTo(game.getRemainingBudget()) >= 0) {
+            // Use the latest remainingBudget from database
+            if (currentBatchSpend.compareTo(currentTickBudget) >= 0 || 
+                currentBatchSpend.compareTo(currentRemainingBudget) >= 0) {
                 log.info("Batch budget exhausted. Processing remaining users as losses.");
                 // Process remaining users as losses
-                for (int i = shuffledUsernames.indexOf(username) + 1; i < shuffledUsernames.size(); i++) {
+                for (int i = userIndex + 1; i < shuffledUsernames.size(); i++) {
                     User remainingUser = userService.getOrCreateUser(shuffledUsernames.get(i), null, null);
                     results.add(createLossResult(remainingUser, game, request.getBatchId()));
                 }
@@ -126,16 +189,53 @@ public class RewardService {
             }
         }
 
-        // Step 7: Update game budget
+        // Step 7: Atomically update game budget
+        // Re-read game with lock to ensure we have latest state before deducting
         if (currentBatchSpend.compareTo(BigDecimal.ZERO) > 0) {
-            game.deductBudget(currentBatchSpend);
-            gameRepository.save(game);
-        }
-
-        // Check if game budget is exhausted
-        if (game.getRemainingBudget().compareTo(BigDecimal.ZERO) <= 0) {
-            game.setStatus(GameStatus.BUDGET_EXHAUSTED);
-            gameRepository.save(game);
+            game = gameRepository.findByIdWithLock(request.getGameId())
+                    .orElseThrow(() -> new GameStateException("Game not found: " + request.getGameId()));
+            
+            // Calculate actual spend from transactions to ensure consistency
+            // This prevents any discrepancy between currentBatchSpend and actual transaction amounts
+            BigDecimal actualSpend = results.stream()
+                    .filter(r -> r.getStatus() == TransactionStatus.WIN)
+                    .map(UserRewardResult::getAmount)
+                    .filter(Objects::nonNull)
+                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+            
+            // Use actual spend from transactions instead of tracked spend
+            BigDecimal spendToDeduct = actualSpend;
+            
+            // Double-check budget is still sufficient
+            if (game.getRemainingBudget().compareTo(spendToDeduct) < 0) {
+                log.error("CRITICAL: Insufficient budget for batch {}: required {}, available {}. " +
+                        "This should not happen with proper locking. Using available budget.", 
+                        request.getBatchId(), spendToDeduct, game.getRemainingBudget());
+                // This should never happen with proper pessimistic locking, but if it does,
+                // we use the available budget to prevent negative budget
+                spendToDeduct = game.getRemainingBudget();
+                
+                // Log warning if there's a discrepancy
+                if (spendToDeduct.compareTo(actualSpend) < 0) {
+                    log.error("Budget adjustment required: transactions total {}, but only {} available. " +
+                            "This indicates a race condition that should have been prevented by locking.",
+                            actualSpend, spendToDeduct);
+                }
+            }
+            
+            if (spendToDeduct.compareTo(BigDecimal.ZERO) > 0) {
+                game.deductBudget(spendToDeduct);
+                gameRepository.save(game);
+                
+                // Update currentBatchSpend to match actual deduction
+                currentBatchSpend = spendToDeduct;
+                
+                // Check if game budget is exhausted
+                if (game.getRemainingBudget().compareTo(BigDecimal.ZERO) <= 0) {
+                    game.setStatus(GameStatus.BUDGET_EXHAUSTED);
+                    gameRepository.save(game);
+                }
+            }
         }
 
         long duration = System.currentTimeMillis() - startTime;
@@ -155,11 +255,24 @@ public class RewardService {
     /**
      * Process individual user reward decision.
      * Implements the randomization and constraint checking logic.
+     * Uses pessimistic locking on vouchers to prevent inventory race conditions.
+     * 
+     * @param user The user to process
+     * @param game The game entity (for transaction creation)
+     * @param gameId The game ID (for re-reading game state if needed)
+     * @param batchId The batch ID
+     * @param candidateVouchers List of candidate vouchers
+     * @param tickBudget Current tick budget
+     * @param currentBatchSpend Current batch spend so far
+     * @param currentRemainingBudget Current remaining game budget (to avoid stale game object)
+     * @param winProbability Win probability for the game
+     * @return UserRewardResult with the outcome
      */
-    private UserRewardResult processUserReward(User user, Game game, String batchId,
+    private UserRewardResult processUserReward(User user, Game game, Long gameId, String batchId,
                                                List<Voucher> candidateVouchers,
                                                BigDecimal tickBudget,
                                                BigDecimal currentBatchSpend,
+                                               BigDecimal currentRemainingBudget,
                                                Double winProbability) {
         // Generate random seed for win/loss decision
         double randomValue = random.nextDouble();
@@ -175,30 +288,56 @@ public class RewardService {
         List<Voucher> shuffledVouchers = new ArrayList<>(candidateVouchers);
         Collections.shuffle(shuffledVouchers, random);
 
-        for (Voucher voucher : shuffledVouchers) {
-            // Constraint checks
-            BigDecimal potentialSpend = currentBatchSpend.add(voucher.getCost());
+        for (Voucher candidateVoucher : shuffledVouchers) {
+            // Constraint checks on candidate voucher (preliminary check)
+            BigDecimal potentialSpend = currentBatchSpend.add(candidateVoucher.getCost());
             
             boolean withinTickBudget = potentialSpend.compareTo(tickBudget) <= 0;
-            boolean withinGameBudget = potentialSpend.compareTo(game.getRemainingBudget()) <= 0;
-            boolean hasInventory = voucher.isAvailable();
+            // Use currentRemainingBudget parameter instead of stale game object
+            boolean withinGameBudget = potentialSpend.compareTo(currentRemainingBudget) <= 0;
 
-            if (withinTickBudget && withinGameBudget && hasInventory) {
-                // All constraints pass - assign voucher
-                try {
-                    // Atomically decrement inventory
-                    voucher.decrementInventory();
-                    voucherRepository.save(voucher);
+            if (!withinTickBudget || !withinGameBudget) {
+                continue; // Skip this voucher - doesn't fit budget
+            }
+
+            // CRITICAL: Lock voucher before checking availability and decrementing
+            // This prevents race conditions where multiple batches try to use the same voucher
+            try {
+                Voucher lockedVoucher = voucherRepository.findByIdWithLock(candidateVoucher.getId())
+                        .orElse(null);
+                
+                if (lockedVoucher == null) {
+                    continue; // Voucher no longer exists
+                }
+
+                // Re-check availability with locked voucher (most up-to-date state)
+                boolean hasInventory = lockedVoucher.isAvailable();
+                BigDecimal lockedVoucherCost = lockedVoucher.getCost();
+                
+                // Re-check budget constraints with locked voucher cost (in case it changed)
+                // Re-read game state to get latest budget (critical for accuracy)
+                Game currentGame = gameRepository.findByIdWithLock(gameId)
+                        .orElseThrow(() -> new GameStateException("Game not found: " + gameId));
+                BigDecimal latestRemainingBudget = currentGame.getRemainingBudget();
+                
+                BigDecimal lockedPotentialSpend = currentBatchSpend.add(lockedVoucherCost);
+                boolean lockedWithinTickBudget = lockedPotentialSpend.compareTo(tickBudget) <= 0;
+                boolean lockedWithinGameBudget = lockedPotentialSpend.compareTo(latestRemainingBudget) <= 0;
+
+                if (hasInventory && lockedWithinTickBudget && lockedWithinGameBudget) {
+                    // All constraints pass - atomically decrement inventory
+                    lockedVoucher.decrementInventory();
+                    voucherRepository.save(lockedVoucher);
 
                     // Create win transaction
                     RewardTransaction transaction = RewardTransaction.builder()
                             .user(user)
-                            .game(game)
-                            .voucher(voucher)
+                            .game(currentGame)
+                            .voucher(lockedVoucher)
                             .batchId(batchId)
                             .status(TransactionStatus.WIN)
-                            .amount(voucher.getCost())
-                            .rewardMessage("Congratulations! You won: " + voucher.getDescription())
+                            .amount(lockedVoucherCost)
+                            .rewardMessage("Congratulations! You won: " + lockedVoucher.getDescription())
                             .build();
 
                     transactionRepository.save(transaction);
@@ -206,17 +345,21 @@ public class RewardService {
                     return UserRewardResult.builder()
                             .username(user.getUsername())
                             .status(TransactionStatus.WIN)
-                            .voucherId(voucher.getId())
-                            .voucherCode(voucher.getVoucherCode())
-                            .amount(voucher.getCost())
-                            .message("Congratulations! You won: " + voucher.getDescription())
+                            .voucherId(lockedVoucher.getId())
+                            .voucherCode(lockedVoucher.getVoucherCode())
+                            .amount(lockedVoucherCost)
+                            .message("Congratulations! You won: " + lockedVoucher.getDescription())
                             .build();
 
-                } catch (Exception e) {
-                    log.error("Error assigning voucher {} to user {}: {}", 
-                            voucher.getId(), user.getUsername(), e.getMessage());
-                    // Continue to next voucher
+                } else {
+                    // Voucher no longer available or doesn't fit budget - try next one
+                    log.debug("Voucher {} not available or doesn't fit budget. Available: {}, Within tick: {}, Within game: {}", 
+                            lockedVoucher.getId(), hasInventory, lockedWithinTickBudget, lockedWithinGameBudget);
                 }
+            } catch (Exception e) {
+                log.error("Error assigning voucher {} to user {}: {}", 
+                        candidateVoucher.getId(), user.getUsername(), e.getMessage(), e);
+                // Continue to next voucher
             }
         }
 
